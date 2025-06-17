@@ -6,15 +6,20 @@ import urllib.parse
 
 import yt_dlp
 
+# Configure logging for better visibility in Render logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
 
+# Define the folder for temporary downloads
+# This will be created inside the container's ephemeral storage
 DOWNLOAD_FOLDER = 'temp_downloads'
 
+# Ensure the download folder exists at startup
+# In a containerized environment, this folder will be recreated on each deploy/restart
 if os.path.exists(DOWNLOAD_FOLDER):
     logging.info(f"Removing existing download folder: {DOWNLOAD_FOLDER}")
-    shutil.rmtree(DOWNLOAD_FOLDER)
+    shutil.rmtree(DOWNLOAD_FOLDER) # Clean up any old files from previous runs (if container reused)
 logging.info(f"Creating download folder: {DOWNLOAD_FOLDER}")
 os.makedirs(DOWNLOAD_FOLDER)
 
@@ -163,12 +168,16 @@ def index():
 def get_info():
     url = request.json.get('url')
     if not url:
+        logging.warning("Received request with no URL.")
         return jsonify({'error': 'URL is required'}), 400
 
     logging.info(f"Fetching info for URL: {url}")
     ydl_opts = {
         'quiet': True,
         'noplaylist': True,
+        # 'nocheckcertificate': True, # Uncomment if you face SSL errors with some sites
+        # 'retries': 5, # Number of retries for network errors
+        'extract_flat': True, # Faster info extraction if you don't need all details
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -176,6 +185,7 @@ def get_info():
             
             formats_to_send = []
             for f in info.get('formats', []):
+                # Filter for MP4 video formats with a video codec (i.e., not just audio)
                 if f.get('ext') == 'mp4' and f.get('vcodec') != 'none':
                     resolution_str = f.get('resolution')
 
@@ -183,26 +193,31 @@ def get_info():
                         if f.get('height'):
                             resolution_str = f'{f.get("height")}p'
                         else:
-                            continue
-                    
+                            continue # Skip if no meaningful resolution info
+
+                    # Extract numerical height for filtering
                     try:
-                        # Extract numerical height for filtering
-                        height = int(resolution_str.split('x')[-1].replace('p',''))
+                        # Handle resolutions like "1920x1080" or "1080p"
+                        if 'x' in resolution_str:
+                            height = int(resolution_str.split('x')[-1])
+                        elif 'p' in resolution_str:
+                            height = int(resolution_str.replace('p', ''))
+                        else:
+                            continue # Cannot parse resolution
                     except ValueError:
                         continue # Skip if resolution string cannot be parsed
 
-                    # --- NEW FILTER: Only include resolutions 720p or higher ---
-                    if height >= 720: # Filter out anything below 720p
+                    # --- FILTER: Only include resolutions 720p or higher ---
+                    if height >= 720:
                         formats_to_send.append({
                             'format_id': f['format_id'],
                             'resolution': resolution_str,
                             'filesize': f.get('filesize') or f.get('filesize_approx'),
                         })
-                    # --- END NEW FILTER ---
 
             # Sort formats by height (resolution) in descending order to show HD first
             sorted_formats = sorted(formats_to_send, 
-                                    key=lambda x: int(x['resolution'].split('x')[-1].replace('p','')) if x['resolution'] else 0,
+                                    key=lambda x: int(x['resolution'].split('x')[-1].replace('p','')) if 'x' in x['resolution'] else int(x['resolution'].replace('p','')),
                                     reverse=True)
             
             response_data = {
@@ -211,12 +226,24 @@ def get_info():
                 'formats': sorted_formats,
                 'original_url': url,
             }
-            logging.info(f"Found {len(sorted_formats)} formats for '{info.get('title')}'.")
+            logging.info(f"Found {len(sorted_formats)} suitable MP4 formats for '{info.get('title', 'Unknown Title')}'.")
             return jsonify(response_data)
 
+    except yt_dlp.utils.DownloadError as e:
+        logging.error(f"yt-dlp DownloadError fetching info for {url}: {e}")
+        # Common errors for yt-dlp.utils.DownloadError might include geo-restrictions, private videos, etc.
+        error_message = "Could not process this URL. It may be private, geo-restricted, or invalid."
+        if "YouTube said: This video is unavailable" in str(e):
+             error_message = "This video is unavailable."
+        elif "Private video" in str(e):
+             error_message = "This is a private video."
+        elif "geographic restriction" in str(e):
+             error_message = "This video is geographically restricted."
+
+        return jsonify({'error': error_message}), 500
     except Exception as e:
-        logging.error(f"Error fetching info: {e}")
-        return jsonify({'error': 'Could not process this URL. It may be private, geo-restricted, or invalid.'}), 500
+        logging.error(f"General error fetching info for {url}: {e}", exc_info=True) # exc_info=True for full traceback
+        return jsonify({'error': 'An unexpected error occurred while fetching video information.'}), 500
 
 @app.route('/download')
 def download():
@@ -224,50 +251,66 @@ def download():
     format_id = request.args.get('format_id')
 
     if not url or not format_id:
+        logging.warning("Download request missing URL or format ID.")
         return "Missing URL or format ID", 400
     
     logging.info(f"Starting download for format '{format_id}' from URL: {url}")
 
     def progress_hook(d):
         if d['status'] == 'finished':
-            logging.info(f"yt-dlp has finished downloading.")
-        if d['status'] == 'downloading':
-            pass
-
+            logging.info(f"yt-dlp has finished downloading '{d.get('filename')}'.")
+        # You can add more detailed progress logging here if needed
 
     ydl_opts = {
-        'format': f'{format_id}+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
-        'noplaylist': True,
+        'format': f'{format_id}+bestaudio/best', # Download specified video format + best audio
+        'merge_output_format': 'mp4', # Ensure the final output is MP4
+        'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'), # Save to temp_downloads
+        'noplaylist': True, # Do not download playlists
         'progress_hooks': [progress_hook],
+        # Add a longer timeout for downloads, common for larger files on cloud
+        'download_archive': False, # Do not keep track of downloaded videos in a file
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            base, _ = os.path.splitext(ydl.prepare_filename(info))
-            downloaded_path = base + '.mp4'
+            # yt-dlp sometimes adds numerical suffixes if files exist
+            # The path will be the one prepared by yt-dlp
+            downloaded_path = ydl.prepare_filename(info)
+            # Ensure it's the correct merged .mp4 path
+            base, ext = os.path.splitext(downloaded_path)
+            if ext != '.mp4': # If it's still .webm or .mkv, ensure it's changed to .mp4
+                downloaded_path = base + '.mp4'
 
         if not os.path.exists(downloaded_path):
+            logging.error(f"File expected at {downloaded_path} not found after yt-dlp download.")
             raise FileNotFoundError(f"File not found after download and merge attempt: {downloaded_path}")
         
         logging.info(f"File successfully prepared at: {downloaded_path}")
 
-        def generate():
+        def generate_file_stream():
             try:
                 with open(downloaded_path, 'rb') as f:
-                    yield from f
+                    # Read in chunks to avoid loading entire file into memory
+                    while True:
+                        chunk = f.read(8192) # Read 8KB chunks
+                        if not chunk:
+                            break
+                        yield chunk
                 logging.info(f"Finished streaming {downloaded_path} to client.")
             finally:
+                # Clean up the downloaded file immediately after streaming
                 try:
-                    os.remove(downloaded_path)
-                    logging.info(f"Successfully cleaned up and removed {downloaded_path}.")
+                    if os.path.exists(downloaded_path):
+                        os.remove(downloaded_path)
+                        logging.info(f"Successfully cleaned up and removed {downloaded_path}.")
                 except OSError as e:
                     logging.error(f"Error deleting file {downloaded_path}: {e}")
 
-        res = Response(generate(), mimetype='video/mp4')
+        # Set correct headers for file download
+        res = Response(generate_file_stream(), mimetype='video/mp4')
         
+        # Encode filename for safe use in Content-Disposition header
         original_filename = os.path.basename(downloaded_path)
         encoded_filename = urllib.parse.quote(original_filename.encode('utf-8'))
         
@@ -278,12 +321,15 @@ def download():
 
         return res
 
+    except yt_dlp.utils.DownloadError as e:
+        logging.error(f"yt-dlp DownloadError during download for {url}: {e}")
+        return f"Download failed. The video might be unavailable, geo-restricted, or private. Error: {str(e)}", 500
     except Exception as e:
-        logging.error(f"Download process failed: {e}")
-        return f"An error occurred during the download process: {str(e)}", 500
-
+        logging.error(f"An unexpected error occurred during download process for {url}: {e}", exc_info=True)
+        return f"An unexpected error occurred during the download process: {str(e)}", 500
 
 if __name__ == '__main__':
-   # Use environment variable for PORT, default to 8080 or 5000 for local
-    port = int(os.environ.get("PORT", 8080))
+    # Use environment variable for PORT, default to 10000 for local testing
+    # This matches the EXPOSE and CMD in the Dockerfile
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
