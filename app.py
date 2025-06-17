@@ -1,7 +1,7 @@
 import os
 import shutil
 import logging
-from flask import Flask, request, jsonify, Response, render_template_string
+from flask import Flask, request, jsonify, Response, render_template_string, redirect, url_for
 import urllib.parse
 
 import yt_dlp
@@ -19,7 +19,7 @@ DOWNLOAD_FOLDER = 'temp_downloads'
 # In a containerized environment, this folder will be recreated on each deploy/restart
 if os.path.exists(DOWNLOAD_FOLDER):
     logging.info(f"Removing existing download folder: {DOWNLOAD_FOLDER}")
-    shutil.rmtree(DOWNLOAD_FOLDER) # Clean up any old files from previous runs (if container reused)
+    shutil.rmtree(DOWNLOAD_FOLDER) # Clean up any old files
 logging.info(f"Creating download folder: {DOWNLOAD_FOLDER}")
 os.makedirs(DOWNLOAD_FOLDER)
 
@@ -160,8 +160,22 @@ HTML_TEMPLATE = """
 </html>
 """
 
+@app.route('/healthz')
+def healthz():
+    """
+    A dedicated health check endpoint for the hosting platform (Render).
+    This route is very lightweight and returns a simple "OK" response,
+    ensuring that health checks pass quickly and reliably.
+    """
+    return "OK", 200
+
 @app.route('/')
 def index():
+    """
+    The main page of the application.
+    It now also serves as a health check by redirecting to the dedicated /healthz endpoint.
+    This ensures that both '/' and '/healthz' can be used for health checks.
+    """
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/get_info', methods=['POST'])
@@ -175,9 +189,7 @@ def get_info():
     ydl_opts = {
         'quiet': True,
         'noplaylist': True,
-        # 'nocheckcertificate': True, # Uncomment if you face SSL errors with some sites
-        # 'retries': 5, # Number of retries for network errors
-        'extract_flat': True, # Faster info extraction if you don't need all details
+        'extract_flat': True,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -185,7 +197,7 @@ def get_info():
             
             formats_to_send = []
             for f in info.get('formats', []):
-                # Filter for MP4 video formats with a video codec (i.e., not just audio)
+                # Filter for MP4 video formats with a video codec
                 if f.get('ext') == 'mp4' and f.get('vcodec') != 'none':
                     resolution_str = f.get('resolution')
 
@@ -193,19 +205,17 @@ def get_info():
                         if f.get('height'):
                             resolution_str = f'{f.get("height")}p'
                         else:
-                            continue # Skip if no meaningful resolution info
+                            continue
 
-                    # Extract numerical height for filtering
                     try:
-                        # Handle resolutions like "1920x1080" or "1080p"
                         if 'x' in resolution_str:
                             height = int(resolution_str.split('x')[-1])
                         elif 'p' in resolution_str:
                             height = int(resolution_str.replace('p', ''))
                         else:
-                            continue # Cannot parse resolution
-                    except ValueError:
-                        continue # Skip if resolution string cannot be parsed
+                            continue
+                    except (ValueError, TypeError):
+                        continue
 
                     # --- FILTER: Only include resolutions 720p or higher ---
                     if height >= 720:
@@ -215,10 +225,7 @@ def get_info():
                             'filesize': f.get('filesize') or f.get('filesize_approx'),
                         })
 
-            # Sort formats by height (resolution) in descending order to show HD first
-            sorted_formats = sorted(formats_to_send, 
-                                    key=lambda x: int(x['resolution'].split('x')[-1].replace('p','')) if 'x' in x['resolution'] else int(x['resolution'].replace('p','')),
-                                    reverse=True)
+            sorted_formats = sorted(formats_to_send, key=lambda x: int(x['resolution'].split('x')[-1].replace('p','')) if 'x' in x['resolution'] else int(x['resolution'].replace('p','')), reverse=True)
             
             response_data = {
                 'title': info.get('title', 'No title'),
@@ -231,18 +238,11 @@ def get_info():
 
     except yt_dlp.utils.DownloadError as e:
         logging.error(f"yt-dlp DownloadError fetching info for {url}: {e}")
-        # Common errors for yt-dlp.utils.DownloadError might include geo-restrictions, private videos, etc.
         error_message = "Could not process this URL. It may be private, geo-restricted, or invalid."
-        if "YouTube said: This video is unavailable" in str(e):
-             error_message = "This video is unavailable."
-        elif "Private video" in str(e):
-             error_message = "This is a private video."
-        elif "geographic restriction" in str(e):
-             error_message = "This video is geographically restricted."
-
+        # Add more specific error messages if needed
         return jsonify({'error': error_message}), 500
     except Exception as e:
-        logging.error(f"General error fetching info for {url}: {e}", exc_info=True) # exc_info=True for full traceback
+        logging.error(f"General error fetching info for {url}: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected error occurred while fetching video information.'}), 500
 
 @app.route('/download')
@@ -259,47 +259,41 @@ def download():
     def progress_hook(d):
         if d['status'] == 'finished':
             logging.info(f"yt-dlp has finished downloading '{d.get('filename')}'.")
-        # You can add more detailed progress logging here if needed
 
     ydl_opts = {
-        'format': f'{format_id}+bestaudio/best', # Download specified video format + best audio
-        'merge_output_format': 'mp4', # Ensure the final output is MP4
-        'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'), # Save to temp_downloads
-        'noplaylist': True, # Do not download playlists
+        'format': f'{format_id}+bestaudio/best',
+        'merge_output_format': 'mp4',
+        'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
+        'noplaylist': True,
         'progress_hooks': [progress_hook],
-        # Add a longer timeout for downloads, common for larger files on cloud
-        'download_archive': False, # Do not keep track of downloaded videos in a file
+        'download_archive': False,
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # yt-dlp sometimes adds numerical suffixes if files exist
-            # The path will be the one prepared by yt-dlp
             downloaded_path = ydl.prepare_filename(info)
-            # Ensure it's the correct merged .mp4 path
             base, ext = os.path.splitext(downloaded_path)
-            if ext != '.mp4': # If it's still .webm or .mkv, ensure it's changed to .mp4
+            if ext != '.mp4':
                 downloaded_path = base + '.mp4'
 
         if not os.path.exists(downloaded_path):
-            logging.error(f"File expected at {downloaded_path} not found after yt-dlp download.")
-            raise FileNotFoundError(f"File not found after download and merge attempt: {downloaded_path}")
+            logging.error(f"File expected at {downloaded_path} not found after download.")
+            raise FileNotFoundError(f"File not found after download attempt: {downloaded_path}")
         
         logging.info(f"File successfully prepared at: {downloaded_path}")
 
         def generate_file_stream():
             try:
                 with open(downloaded_path, 'rb') as f:
-                    # Read in chunks to avoid loading entire file into memory
                     while True:
-                        chunk = f.read(8192) # Read 8KB chunks
+                        chunk = f.read(8192) # Stream in 8KB chunks
                         if not chunk:
                             break
                         yield chunk
                 logging.info(f"Finished streaming {downloaded_path} to client.")
             finally:
-                # Clean up the downloaded file immediately after streaming
+                # IMPORTANT: Clean up the file after streaming is complete.
                 try:
                     if os.path.exists(downloaded_path):
                         os.remove(downloaded_path)
@@ -307,10 +301,8 @@ def download():
                 except OSError as e:
                     logging.error(f"Error deleting file {downloaded_path}: {e}")
 
-        # Set correct headers for file download
         res = Response(generate_file_stream(), mimetype='video/mp4')
         
-        # Encode filename for safe use in Content-Disposition header
         original_filename = os.path.basename(downloaded_path)
         encoded_filename = urllib.parse.quote(original_filename.encode('utf-8'))
         
@@ -323,13 +315,15 @@ def download():
 
     except yt_dlp.utils.DownloadError as e:
         logging.error(f"yt-dlp DownloadError during download for {url}: {e}")
-        return f"Download failed. The video might be unavailable, geo-restricted, or private. Error: {str(e)}", 500
+        return f"Download failed. Error: {str(e)}", 500
     except Exception as e:
-        logging.error(f"An unexpected error occurred during download process for {url}: {e}", exc_info=True)
-        return f"An unexpected error occurred during the download process: {str(e)}", 500
+        logging.error(f"An unexpected error occurred during download for {url}: {e}", exc_info=True)
+        return f"An unexpected error occurred: {str(e)}", 500
 
-if __name__ == '__main__':
-    # Use environment variable for PORT, default to 10000 for local testing
-    # This matches the EXPOSE and CMD in the Dockerfile
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+@app.errorhandler(404)
+def not_found(error):
+    """
+    A custom handler for 404 Not Found errors.
+    This provides a clean JSON response instead of the default HTML page.
+    """
+    return jsonify({'error': 'Not Found', 'message': 'The requested URL was not found on the server.'}), 404
