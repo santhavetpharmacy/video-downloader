@@ -266,7 +266,8 @@ def download():
         'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
         'noplaylist': True,
         'progress_hooks': [progress_hook],
-        'download_archive': False,
+        # Remove the 'download_archive': False line completely
+        # 'download_archive': False, # <-- REMOVE THIS LINE
     }
     
     try:
@@ -327,3 +328,6 @@ def not_found(error):
     This provides a clean JSON response instead of the default HTML page.
     """
     return jsonify({'error': 'Not Found', 'message': 'The requested URL was not found on the server.'}), 404
+
+if __name__ == '__main__':
+    app.run(debug=True)
